@@ -1,70 +1,35 @@
-# (str) Title of your application
-title = CVSU Offline Tracker
+name: Build APK
 
-# (str) Package name
-package.name = cvsustracker
+on:
+  push:
+    branches: [ main, master ]
 
-# (str) Package domain (needed for android packaging)
-package.domain = org.cvsu
+jobs:
+  build:
+    runs-on: ubuntu-22.04
 
-# (list) Source files to include (let it empty to include all files)
-source.include_exts = py,png,jpg,kv,atlas,db
+    steps:
+    - uses: actions/checkout@v4
 
-# (list) Source directories to include (let it empty to include all)
-source.include_dir = 
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
 
-# (list) Application requirements
-# comma separated e.g. requirements = sqlite3,kivy
-requirements = python3,kivy,sqlite3,pillow,qrcode
+    - name: Set up Java
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'temurin'
+        java-version: '17'
 
-# (str) Custom source folders for requirements
-#requirements.source.kivy = ../../../kivy
+    - name: Build with Buildozer
+      uses: ArtemSBulgakov/buildozer-action@v1
+      id: buildozer
+      with:
+        command: buildozer -v android debug
 
-# (list) Permissions
-android.permissions = INTERNET, WRITE_EXTERNAL_STORAGE, READ_EXTERNAL_STORAGE
-
-# (list) Features
-#android.features = android.hardware.usb.host
-
-# (int) Target Android API, should be as high as possible.
-# android.sdk = 31
-
-# (int) Minimum API your APK will support.
-android.minapi = 21
-
-# (int) Android API to use.
-android.api = 33
-
-# (str) Android NDK version to use
-android.ndk = 25b
-
-# (int) Android NDK API to use. This is the minimum API to use.
-#android.ndk_api = 21
-
-# (bool) Use --private data storage (True) or /sdcard (False)
-#android.private_storage = True
-
-# (str) Full name including package path of the Java class to init
-#android.javaclass = org.kivy.android.PythonActivity
-
-# (str) The orientation to support
-orientation = portrait
-
-# (bool) Indicate whether the application should be full screen or not
-fullscreen = 0
-
-# (list) List of service to declare
-#android.services = 
-
-#
-# iOS specific
-#
-
-# (str) Path to a custom kivy-ios folder
-#ios.kivy_ios_path = ../kivy-ios
-
-# (str) Name of the certificate to use for signing the debug version
-#ios.codesign.debug = "iPhone Developer: <name> (<hash>)"
-
-# (str) Name of the certificate to use for signing the release version
-#ios.codesign.release = %(ios.codesign.debug)s
+    - name: Upload APK Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: package
+        path: bin/*.apk
