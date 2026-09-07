@@ -1,18 +1,54 @@
-[app]
-title = CvSU Offline Student Tracker
+# (str) Title of your application
+title = CVSU Offline Tracker
+
+# (str) Package name
 package.name = cvsustracker
+
+# (str) Package domain (needed for android packaging)
 package.domain = org.cvsu
-source.dir = .
-source.include_exts = py,png,jpg,kv,atlas
-version = 1.0
+
+# (list) Source files to include (let it empty to include all files)
+source.include_exts = py,png,jpg,kv,atlas,db
+
+# (list) Source directories to include (let it empty to include all)
+source.include_dir = 
+
+# (list) Application requirements
+# comma separated e.g. requirements = sqlite3,kivy
 requirements = python3,kivy,sqlite3,pillow,qrcode
-orientation = portrait
-osx.python_version = 3
-osx.kivy_version = 1.9.1
-fullscreen = 0
-android.permissions = CAMERA,WRITE_EXTERNAL_STORAGE,READ_EXTERNAL_STORAGE
-android.api = 33
+
+# (str) Custom source folders for requirements
+#requirements.source.kivy = ../../../kivy
+
+# (list) Permissions
+android.permissions = INTERNET, WRITE_EXTERNAL_STORAGE, READ_EXTERNAL_STORAGE
+
+# (list) Features
+#android.features = android.hardware.usb.host
+
+# (int) Target Android API, should be as high as possible.
+# android.sdk = 31
+
+# (int) Minimum API your APK will support.
 android.minapi = 21
-android.sdk = 31
+
+# (int) Android API to use.
+android.api = 33
+
+# (str) Android NDK version to use
 android.ndk = 25b
-android.archs = arm64-v8a
+
+# (int) Android NDK API to use. This is the minimum API to use.
+#android.ndk_api = 21
+
+# (bool) Use --private data storage (True) or /sdcard (False)
+#android.private_storage = True
+
+# (str) Full name including package path of the Java class to init
+#android.javaclass = org.kivy.android.PythonActivity
+
+# (str) The orientation to support
+orientation = portrait
+
+# (bool) Indicate whether the application should be full screen or not
+fullscreen = 0
