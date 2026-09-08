@@ -19,12 +19,29 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.10"
+          cache: pip
 
       - name: Setup Java
         uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
+
+      - name: Cache Buildozer global dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.buildozer
+          key: buildozer-global-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
+          restore-keys: |
+            buildozer-global-${{ runner.os }}-
+
+      - name: Cache project Buildozer directory
+        uses: actions/cache@v4
+        with:
+          path: .buildozer
+          key: buildozer-project-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
+          restore-keys: |
+            buildozer-project-${{ runner.os }}-
 
       - name: Install system dependencies
         run: |
@@ -50,14 +67,31 @@ jobs:
           python -m pip install "Cython==0.29.33"
           python -m pip install buildozer
 
-      - name: Accept Android SDK licenses
+      - name: Build APK with retries
+        shell: bash
         run: |
-          mkdir -p "$HOME/.android"
-          yes | sdkmanager --licenses || true
+          set -o pipefail
 
-      - name: Build APK
-        run: |
-          yes | buildozer -v android debug
+          for attempt in 1 2 3 4 5; do
+            echo "========================================"
+            echo "Build attempt $attempt of 5"
+            echo "========================================"
+
+            if yes | buildozer -v android debug; then
+              echo "Build succeeded on attempt $attempt"
+              exit 0
+            fi
+
+            if [ "$attempt" -lt 5 ]; then
+              delay=$((attempt * 20))
+              echo "Build failed. This may be a temporary dependency/network error."
+              echo "Waiting ${delay} seconds before retrying..."
+              sleep "$delay"
+            fi
+          done
+
+          echo "Build failed after 5 attempts."
+          exit 1
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
