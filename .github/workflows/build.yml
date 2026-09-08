@@ -13,10 +13,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.10"
 
@@ -27,7 +27,7 @@ jobs:
           java-version: "17"
 
       - name: Cache Buildozer global dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.buildozer
           key: buildozer-global-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
@@ -35,7 +35,7 @@ jobs:
             buildozer-global-${{ runner.os }}-
 
       - name: Cache project Buildozer directory
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: .buildozer
           key: buildozer-project-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
@@ -49,6 +49,7 @@ jobs:
             git \
             zip \
             unzip \
+            curl \
             autoconf \
             libtool \
             pkg-config \
@@ -65,6 +66,28 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install "Cython==0.29.33"
           python -m pip install buildozer
+
+      - name: Prepare reliable FreeType download
+        shell: bash
+        run: |
+          set -e
+
+          FREETYPE_DIR="$GITHUB_WORKSPACE/.buildozer/android/platform/build-arm64-v8a/packages/freetype"
+          FREETYPE_FILE="$FREETYPE_DIR/freetype-2.14.1.tar.gz"
+          FREETYPE_MARK="$FREETYPE_DIR/.mark-freetype-2.14.1.tar.gz"
+          FREETYPE_URL="https://download-mirror.savannah.gnu.org/releases/freetype/freetype-2.14.1.tar.gz"
+
+          mkdir -p "$FREETYPE_DIR"
+
+          if [ ! -s "$FREETYPE_FILE" ]; then
+            echo "Downloading FreeType 2.14.1 from mirror..."
+            curl -fL --retry 8 --retry-all-errors --retry-delay 5 \
+              -o "$FREETYPE_FILE" "$FREETYPE_URL"
+          fi
+
+          test -s "$FREETYPE_FILE"
+          touch "$FREETYPE_MARK"
+          echo "FreeType archive prepared: $FREETYPE_FILE"
 
       - name: Build APK with retries
         shell: bash
@@ -93,7 +116,7 @@ jobs:
           exit 1
 
       - name: Upload APK
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: cvsu-offline-tracker-apk
           path: ./bin/*.apk
