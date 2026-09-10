@@ -19,6 +19,10 @@ android.minapi = 21
 android.archs = arm64-v8a
 android.accept_sdk_license = True
 
+# Use the repository's patched FreeType recipe instead of the upstream
+# recipe download URL, which has been failing in GitHub Actions.
+p4a.local_recipes = recipes
+
 [buildozer]
 
 log_level = 2
