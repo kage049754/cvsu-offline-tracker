@@ -69,12 +69,8 @@ jobs:
 
       - name: Build APK with retries
         shell: bash
-        env:
-          URL_freetype: https://nongnu.uib.no/freetype/freetype-2.14.1.tar.gz
         run: |
           set -o pipefail
-
-          echo "Using FreeType mirror: $URL_freetype"
 
           for attempt in 1 2 3 4 5; do
             echo "========================================"
