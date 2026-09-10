@@ -77,7 +77,7 @@ jobs:
             echo "Build attempt $attempt of 5"
             echo "========================================"
 
-            if yes | buildozer -v android debug; then
+           if echo | buildozer -v android debug; then
               echo "Build succeeded on attempt $attempt"
               exit 0
             fi
