@@ -1,523 +1,427 @@
 #!/usr/bin/env python3
-"""
-CvSU Offline Student Tracker - Main Production Entry Point
+"""CvSU Offline Student Tracker - phone-ready offline attendance app."""
 
-This is the unified main entry point that works on both desktop and Android.
-Use this file instead of main_production.py.
-
-Features:
-- QR Code scanning and manual entry
-- Offline SQLite database
-- Report export to CSV/TXT
-- Multi-facility support
-- Full Android permission handling
-- Cross-platform storage management
-"""
-
-import os
-import sqlite3
 import csv
+import os
+import shutil
+import sqlite3
 from datetime import datetime
-from threading import Thread
 
+import cv2
+import numpy as np
 import qrcode
+from PIL import Image as PILImage, ImageDraw, ImageFont
 
 from kivy.app import App
-from kivy.uix.boxlayout import BoxLayout
-from kivy.uix.label import Label
-from kivy.uix.textinput import TextInput
-from kivy.uix.button import Button
-from kivy.uix.spinner import Spinner
-from kivy.uix.scrollview import ScrollView
-from kivy.metrics import dp
-from kivy.core.window import Window
-from kivy.logger import Logger
 from kivy.clock import Clock
+from kivy.core.window import Window
+from kivy.metrics import dp
+from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.button import Button
+from kivy.uix.camera import Camera
+from kivy.uix.gridlayout import GridLayout
+from kivy.uix.image import Image
+from kivy.uix.label import Label
+from kivy.uix.popup import Popup
+from kivy.uix.scrollview import ScrollView
+from kivy.uix.spinner import Spinner
+from kivy.uix.textinput import TextInput
 
 from storage_manager import StorageManager
-from qr_scanner import QRScannerModule
 
 try:
     from permissions_handler import PermissionsHandler
-    PERMISSIONS_AVAILABLE = True
-    Logger.info('Main: Android permissions handler loaded')
-except ImportError:
-    PERMISSIONS_AVAILABLE = False
-    Logger.warning('Main: Android permissions not available (normal on desktop)')
+except Exception:
+    PermissionsHandler = None
+
+DB_PATH = StorageManager.get_database_path()
 
 
-# ============================================================
-# DATABASE INITIALIZATION
-# ============================================================
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
 
 def init_db():
-    """Initialize SQLite database with required tables."""
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""CREATE TABLE IF NOT EXISTS sections (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL UNIQUE,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS students (
+        student_number TEXT PRIMARY KEY,
+        full_name TEXT NOT NULL,
+        course_year TEXT NOT NULL,
+        section_id INTEGER,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(section_id) REFERENCES sections(id) ON DELETE SET NULL
+    )""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS activity_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        student_number TEXT NOT NULL,
+        mode TEXT NOT NULL,
+        session_info TEXT NOT NULL,
+        section_name TEXT,
+        timestamp TEXT NOT NULL,
+        attendance_date TEXT NOT NULL,
+        FOREIGN KEY(student_number) REFERENCES students(student_number)
+    )""")
+
+    # Upgrade databases created by the older app without deleting existing data.
+    cols = {r[1] for r in cur.execute("PRAGMA table_info(students)").fetchall()}
+    if "section_id" not in cols:
+        cur.execute("ALTER TABLE students ADD COLUMN section_id INTEGER")
+    log_cols = {r[1] for r in cur.execute("PRAGMA table_info(activity_logs)").fetchall()}
+    if "section_name" not in log_cols:
+        cur.execute("ALTER TABLE activity_logs ADD COLUMN section_name TEXT")
+    if "attendance_date" not in log_cols:
+        cur.execute("ALTER TABLE activity_logs ADD COLUMN attendance_date TEXT")
+        cur.execute("UPDATE activity_logs SET attendance_date = substr(timestamp,1,10) WHERE attendance_date IS NULL")
+    if "timestamp" not in log_cols:
+        cur.execute("ALTER TABLE activity_logs ADD COLUMN timestamp TEXT")
+        cur.execute("UPDATE activity_logs SET timestamp = datetime('now') WHERE timestamp IS NULL")
+    conn.commit()
+    conn.close()
+
+
+def ensure_section(name):
+    name = name.strip()
+    if not name:
+        return None
+    conn = db()
+    conn.execute("INSERT OR IGNORE INTO sections(name) VALUES (?)", (name,))
+    row = conn.execute("SELECT id FROM sections WHERE name=?", (name,)).fetchone()
+    conn.commit()
+    conn.close()
+    return row[0] if row else None
+
+
+def section_names():
+    conn = db()
+    rows = conn.execute("SELECT name FROM sections ORDER BY name COLLATE NOCASE").fetchall()
+    conn.close()
+    return [r[0] for r in rows]
+
+
+def create_qr_card(student_number, full_name, course_year, section_name):
+    """Create a printable/student-shareable QR card with the student's name."""
+    qr = qrcode.QRCode(version=None, box_size=10, border=4)
+    qr.add_data(student_number)
+    qr.make(fit=True)
+    qr_img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
+    width = qr_img.width
+    card = PILImage.new("RGB", (width, width + 190), "white")
+    card.paste(qr_img, (0, 0))
+    draw = ImageDraw.Draw(card)
     try:
-        db_path = StorageManager.get_database_path()
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-
-        # Create students table
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS students (
-                student_number TEXT PRIMARY KEY,
-                full_name TEXT NOT NULL,
-                course_year TEXT NOT NULL,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # Create activity logs table
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS activity_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                student_number TEXT,
-                mode TEXT,
-                session_info TEXT,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY(student_number) REFERENCES students(student_number)
-            )
-        """)
-
-        conn.commit()
-        conn.close()
-        Logger.info('Database: Initialized successfully')
-    except Exception as e:
-        Logger.error(f'Database: Initialization error: {e}')
-        raise
+        font_big = ImageFont.truetype("DejaVuSans-Bold.ttf", 30)
+        font_small = ImageFont.truetype("DejaVuSans.ttf", 20)
+    except Exception:
+        font_big = ImageFont.load_default()
+        font_small = ImageFont.load_default()
+    y = width + 15
+    draw.text((width // 2, y), full_name, fill="black", font=font_big, anchor="ma")
+    draw.text((width // 2, y + 45), f"ID: {student_number}", fill="black", font=font_small, anchor="ma")
+    draw.text((width // 2, y + 75), f"{course_year}  •  {section_name}", fill="black", font=font_small, anchor="ma")
+    draw.text((width // 2, y + 110), "CvSU Offline Student Tracker", fill="black", font=font_small, anchor="ma")
+    folder = StorageManager.get_qr_folder()
+    path = os.path.join(folder, f"{student_number}.png")
+    card.save(path, "PNG")
+    return path
 
 
-def register_student_db(student_number, full_name, course_year):
-    """Register a new student and generate QR code."""
+def register_student(student_number, full_name, course_year, section_name):
     student_number = student_number.strip()
     full_name = full_name.strip()
     course_year = course_year.strip()
-
-    if not student_number or not full_name or not course_year:
-        return {'success': False, 'message': '[ERROR] Please complete all fields.'}
-
-    db_path = StorageManager.get_database_path()
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-
+    section_name = section_name.strip()
+    if not all((student_number, full_name, course_year, section_name)):
+        return False, "Please complete Student ID, Name, Course & Year, and Section."
+    section_id = ensure_section(section_name)
+    conn = db()
     try:
-        cursor.execute(
-            "INSERT INTO students (student_number, full_name, course_year) VALUES (?, ?, ?)",
-            (student_number, full_name, course_year)
-        )
+        conn.execute("INSERT INTO students(student_number,full_name,course_year,section_id) VALUES(?,?,?,?)",
+                     (student_number, full_name, course_year, section_id))
         conn.commit()
-        message = f"[SUCCESS] Registered: {full_name}"
     except sqlite3.IntegrityError:
         conn.close()
-        return {'success': False, 'message': '[INFO] Student ID already exists.'}
-    finally:
-        conn.close()
-
-    # Generate QR code
+        return False, "That Student ID is already registered."
+    conn.close()
     try:
-        qr = qrcode.QRCode(version=1, box_size=10, border=5)
-        qr.add_data(student_number)
-        qr.make(fit=True)
-        img = qr.make_image(fill_color="black", back_color="white")
-
-        qr_folder = StorageManager.get_qr_folder()
-        filename = os.path.join(qr_folder, f"{student_number}.png")
-        img.save(filename)
-        message += f"\nQR saved: {student_number}.png"
-        Logger.info(f'Database: Generated QR for {student_number}')
-    except Exception as e:
-        message += f"\n[WARNING] QR generation failed: {e}"
-        Logger.error(f'Database: QR generation error: {e}')
-
-    return {'success': True, 'message': message}
+        qr_path = create_qr_card(student_number, full_name, course_year, section_name)
+    except Exception as exc:
+        return True, f"Student saved, but QR creation failed: {exc}"
+    return True, qr_path
 
 
-def get_student(student_number):
-    """Retrieve student information from database."""
-    student_number = student_number.strip()
-    if not student_number:
-        return None
-
-    db_path = StorageManager.get_database_path()
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-
-    cursor.execute(
-        "SELECT student_number, full_name, course_year FROM students WHERE student_number = ?",
-        (student_number,)
-    )
-    row = cursor.fetchone()
+def find_student(student_number):
+    conn = db()
+    row = conn.execute("""SELECT s.student_number,s.full_name,s.course_year,COALESCE(sec.name,'')
+                          FROM students s LEFT JOIN sections sec ON sec.id=s.section_id
+                          WHERE s.student_number=?""", (student_number.strip(),)).fetchone()
     conn.close()
     return row
 
 
-def log_student(student_number, mode_name, session_info):
-    """Log a student's attendance manually."""
-    student_number = student_number.strip()
-
-    if not student_number:
-        return {'success': False, 'message': '[ERROR] Enter a student number.'}
-
-    if not session_info.strip():
-        session_info = f"General {mode_name} Session"
-
-    student = get_student(student_number)
+def record_attendance(student_number, mode, session, selected_section):
+    student = find_student(student_number)
     if not student:
-        return {'success': False, 'message': '[ERROR] Student ID not found.'}
-
-    s_num, full_name, course_year = student
-
-    db_path = StorageManager.get_database_path()
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-
-    try:
-        cursor.execute(
-            "INSERT INTO activity_logs (student_number, mode, session_info) VALUES (?, ?, ?)",
-            (s_num, mode_name, session_info)
-        )
-        conn.commit()
-        Logger.info(f'Database: Logged {full_name}')
-        return {
-            'success': True,
-            'message': (
-                f"[LOGGED]\n"
-                f"Name: {full_name}\n"
-                f"Course: {course_year}\n"
-                f"ID: {s_num}\n"
-                f"Mode: {mode_name}\n"
-                f"Session: {session_info}"
-            )
-        }
-    except Exception as e:
-        Logger.error(f'Database: Log student error: {e}')
-        return {'success': False, 'message': f'[ERROR] Database error: {str(e)}'}
-    finally:
+        return False, "Student ID is not registered."
+    sid, name, course, student_section = student
+    if selected_section and student_section != selected_section:
+        return False, f"REJECTED: {name} belongs to {student_section or 'another section'}, not {selected_section}."
+    now = datetime.now()
+    session = session.strip() or f"General {mode} Session"
+    conn = db()
+    duplicate = conn.execute("""SELECT id FROM activity_logs
+        WHERE student_number=? AND mode=? AND session_info=? AND attendance_date=?""",
+        (sid, mode, session, now.strftime("%Y-%m-%d"))).fetchone()
+    if duplicate:
         conn.close()
-
-
-def export_reports(mode_name, sort_by, export_type):
-    """Export attendance reports to CSV or TXT format."""
-    db_path = StorageManager.get_database_path()
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-
-    cursor.execute(
-        """
-        SELECT l.timestamp, s.student_number, s.full_name, s.course_year, l.mode, l.session_info
-        FROM activity_logs l
-        JOIN students s ON l.student_number = s.student_number
-        WHERE l.mode = ?
-        """,
-        (mode_name,)
-    )
-    rows = cursor.fetchall()
+        return False, f"Already marked present today: {name}."
+    conn.execute("""INSERT INTO activity_logs
+        (student_number,mode,session_info,section_name,timestamp,attendance_date)
+        VALUES(?,?,?,?,?,?)""", (sid, mode, session, student_section, now.strftime("%Y-%m-%d %H:%M:%S"), now.strftime("%Y-%m-%d")))
+    conn.commit()
     conn.close()
+    return True, f"PRESENT\n{name}\n{sid}\nArrival: {now.strftime('%Y-%m-%d %I:%M:%S %p')}"
 
+
+def export_report(mode, section):
+    conn = db()
+    query = """SELECT l.timestamp,s.student_number,s.full_name,s.course_year,COALESCE(l.section_name,''),l.mode,l.session_info
+               FROM activity_logs l JOIN students s ON s.student_number=l.student_number WHERE l.mode=?"""
+    args = [mode]
+    if section:
+        query += " AND l.section_name=?"
+        args.append(section)
+    query += " ORDER BY l.timestamp DESC"
+    rows = conn.execute(query, args).fetchall()
+    conn.close()
     if not rows:
-        return {'success': False, 'message': f'[INFO] No records found for {mode_name}.'}
+        return None
+    folder = StorageManager.get_reports_folder()
+    path = os.path.join(folder, f"{mode}_{section or 'All'}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["Arrival Date/Time","Student ID","Name","Course & Year","Section","Mode","Session"])
+        w.writerows(rows)
+    return path
 
-    # Sort records
-    if sort_by == "Alphabetical":
-        rows = sorted(rows, key=lambda x: x[2].lower())
-    else:
-        rows = sorted(rows, key=lambda x: x[0], reverse=True)
 
-    reports_folder = StorageManager.get_reports_folder()
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-
+def android_share(path):
+    """Open the Android share sheet for an image/file. No internet is used."""
     try:
-        if export_type == "Spreadsheet (CSV)":
-            filename = os.path.join(reports_folder, f"{mode_name}_Report_{timestamp}.csv")
-            with open(filename, mode='w', newline='', encoding='utf-8') as file:
-                writer = csv.writer(file)
-                writer.writerow(["Timestamp", "Student Number", "Full Name", "Course & Year", "Facility Mode", "Session Title"])
-                writer.writerows(rows)
-        else:
-            filename = os.path.join(reports_folder, f"{mode_name}_Report_{timestamp}.txt")
-            with open(filename, mode='w', encoding='utf-8') as file:
-                file.write("==================================================\n")
-                file.write(f"CvSU SYSTEM FACILITY REPORT: {mode_name.upper()}\n")
-                file.write(f"Generated On: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                file.write(f"Sorting Rule: {sort_by}\n")
-                file.write(f"==================================================\n\n")
-                for row in rows:
-                    file.write(f"Time: {row[0]}\n")
-                    file.write(f"ID No: {row[1]}\n")
-                    file.write(f"Name: {row[2]}\n")
-                    file.write(f"Course: {row[3]}\n")
-                    file.write(f"Mode: {row[4]}\n")
-                    file.write(f"Session: {row[5]}\n")
-                    file.write("-" * 40 + "\n")
-
-        Logger.info(f'Database: Report exported to {filename}')
-        return {'success': True, 'message': f'[SUCCESS] Report saved to Downloads folder.\nFile: {os.path.basename(filename)}'}
-    except Exception as e:
-        Logger.error(f'Database: Export error: {e}')
-        return {'success': False, 'message': f'[ERROR] Export failed: {str(e)}'}
+        from jnius import autoclass
+        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+        Intent = autoclass("android.content.Intent")
+        Uri = autoclass("android.net.Uri")
+        StrictMode = autoclass("android.os.StrictMode")
+        StrictMode.setVmPolicy(StrictMode.VmPolicy.Builder().build())
+        intent = Intent(Intent.ACTION_SEND)
+        intent.setType("image/png" if path.lower().endswith(".png") else "text/csv")
+        intent.putExtra(Intent.EXTRA_STREAM, Uri.fromFile(java.io.File(path)) if False else Uri.parse("file://" + path))
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        chooser = Intent.createChooser(intent, "Share CvSU file")
+        PythonActivity.mActivity.startActivity(chooser)
+        return True
+    except Exception:
+        return False
 
 
-# ============================================================
-# MAIN USER INTERFACE
-# ============================================================
+class ScannerPopup(Popup):
+    def __init__(self, on_result, **kwargs):
+        super().__init__(title="Scan Student QR", size_hint=(0.96, 0.86), **kwargs)
+        self.on_result = on_result
+        self.camera = Camera(play=True, resolution=(640, 480), index=0)
+        self.last_value = None
+        root = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(8))
+        root.add_widget(self.camera)
+        root.add_widget(Label(text="Point the camera at the student's QR code", size_hint_y=None, height=dp(45)))
+        close = Button(text="Cancel", size_hint_y=None, height=dp(48))
+        close.bind(on_release=self.dismiss)
+        root.add_widget(close)
+        self.content = root
+        Clock.schedule_interval(self.scan_frame, 0.35)
 
-class CvSUSystemUI(BoxLayout):
+    def scan_frame(self, _dt):
+        if not self.camera.texture:
+            return
+        try:
+            tex = self.camera.texture
+            pixels = np.frombuffer(tex.pixels, dtype=np.uint8)
+            frame = pixels.reshape(tex.height, tex.width, 4)
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
+            value, points, _ = cv2.QRCodeDetector().detectAndDecode(frame)
+            if value and value != self.last_value:
+                self.last_value = value.strip()
+                Clock.unschedule(self.scan_frame)
+                self.dismiss()
+                self.on_result(self.last_value)
+        except Exception:
+            pass
 
+    def dismiss(self, *args, **kwargs):
+        Clock.unschedule(self.scan_frame)
+        try:
+            self.camera.play = False
+        except Exception:
+            pass
+        return super().dismiss(*args, **kwargs)
+
+
+class AppUI(BoxLayout):
     def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.orientation = "vertical"
-        self.padding = dp(15)
-        self.spacing = dp(8)
+        super().__init__(orientation="vertical", padding=dp(10), spacing=dp(8), **kwargs)
+        self.qr_path = None
+        self.build_ui()
+        self.refresh_sections()
 
-        self.qr_scanner = QRScannerModule(StorageManager.get_database_path())
-        self.scanning = False
+    def label(self, text, size=30):
+        return Label(text=text, bold=True, font_size=dp(size), size_hint_y=None, height=dp(36))
 
-        # Title bar
-        title_box = BoxLayout(size_hint_y=None, height=dp(60), spacing=dp(10))
-        title = Label(
-            text="CvSU Offline Student Tracker",
-            font_size=dp(18),
-            bold=True
-        )
-        title_box.add_widget(title)
-        self.add_widget(title_box)
-
-        # Scroll area
+    def build_ui(self):
+        self.add_widget(self.label("CvSU Offline Attendance", 20))
         scroll = ScrollView()
-        content = BoxLayout(orientation="vertical", spacing=dp(8), size_hint_y=None)
-        content.bind(minimum_height=content.setter("height"))
+        body = BoxLayout(orientation="vertical", spacing=dp(8), size_hint_y=None)
+        body.bind(minimum_height=body.setter("height"))
 
-        # Registration section
-        content.add_widget(
-            Label(text="Student Registration", font_size=dp(16), bold=True,
-                  size_hint_y=None, height=dp(30))
-        )
+        body.add_widget(self.label("1. Section", 16))
+        row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(6))
+        self.section_spinner = Spinner(text="Select Section", values=(), size_hint_x=0.65)
+        row.add_widget(self.section_spinner)
+        self.new_section = TextInput(hint_text="New section (BSIT 2-6)", multiline=False, size_hint_x=0.35)
+        row.add_widget(self.new_section)
+        body.add_widget(row)
+        add_section = Button(text="Add / Select Section", size_hint_y=None, height=dp(44))
+        add_section.bind(on_release=self.add_section)
+        body.add_widget(add_section)
 
-        self.txt_id = TextInput(
-            hint_text="Student Number (e.g. 2023-12345)",
-            multiline=False, size_hint_y=None, height=dp(42)
-        )
-        content.add_widget(self.txt_id)
+        body.add_widget(self.label("2. Register Student + QR", 16))
+        self.student_id = TextInput(hint_text="Student ID", multiline=False, size_hint_y=None, height=dp(44))
+        self.student_name = TextInput(hint_text="Full Name", multiline=False, size_hint_y=None, height=dp(44))
+        self.student_course = TextInput(hint_text="Course & Year", multiline=False, size_hint_y=None, height=dp(44))
+        for w in (self.student_id, self.student_name, self.student_course): body.add_widget(w)
+        reg = Button(text="Create Student QR", size_hint_y=None, height=dp(48))
+        reg.bind(on_release=self.register)
+        body.add_widget(reg)
 
-        self.txt_name = TextInput(
-            hint_text="Full Name", multiline=False,
-            size_hint_y=None, height=dp(42)
-        )
-        content.add_widget(self.txt_name)
+        body.add_widget(self.label("3. Attendance", 16))
+        self.session = TextInput(hint_text="Subject / Session", multiline=False, size_hint_y=None, height=dp(44))
+        body.add_widget(self.session)
+        scan_row = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(6))
+        scan = Button(text="SCAN QR")
+        scan.bind(on_release=self.scan)
+        manual = Button(text="Mark by ID")
+        manual.bind(on_release=self.manual_attendance)
+        scan_row.add_widget(scan); scan_row.add_widget(manual)
+        body.add_widget(scan_row)
+        self.manual_id = TextInput(hint_text="Student ID for manual check-in", multiline=False, size_hint_y=None, height=dp(44))
+        body.add_widget(self.manual_id)
 
-        self.txt_course = TextInput(
-            hint_text="Course & Year (e.g. BSIT 3-1)",
-            multiline=False, size_hint_y=None, height=dp(42)
-        )
-        content.add_widget(self.txt_course)
+        body.add_widget(self.label("4. Reports", 16))
+        export = Button(text="Export Section Attendance CSV", size_hint_y=None, height=dp(48))
+        export.bind(on_release=self.export)
+        body.add_widget(export)
 
-        self.btn_register = Button(
-            text="Register Student + Generate QR",
-            size_hint_y=None, height=dp(48),
-            background_color=(0.1, 0.6, 0.3, 1)
-        )
-        self.btn_register.bind(on_press=self.handle_registration)
-        content.add_widget(self.btn_register)
-
-        # Facility & Session
-        content.add_widget(
-            Label(text="Facility & Session", font_size=dp(16), bold=True,
-                  size_hint_y=None, height=dp(30))
-        )
-
-        self.mode_spinner = Spinner(
-            text="Attendance",
-            values=("Attendance", "Library", "Clinic", "Event Entry"),
-            size_hint_y=None, height=dp(42)
-        )
-        content.add_widget(self.mode_spinner)
-
-        self.txt_session = TextInput(
-            hint_text="Session Title / Subject",
-            multiline=False, size_hint_y=None, height=dp(42)
-        )
-        content.add_widget(self.txt_session)
-
-        # Student Check-in
-        content.add_widget(
-            Label(text="Student Check-In", font_size=dp(16), bold=True,
-                  size_hint_y=None, height=dp(30))
-        )
-
-        self.txt_scan_id = TextInput(
-            hint_text="Enter Student Number or scan QR",
-            multiline=False, size_hint_y=None, height=dp(42)
-        )
-        content.add_widget(self.txt_scan_id)
-
-        btn_layout = BoxLayout(orientation="horizontal", spacing=dp(8), size_hint_y=None, height=dp(48))
-
-        self.btn_log = Button(
-            text="Log Student",
-            size_hint_x=0.6,
-            background_color=(0.2, 0.4, 0.8, 1)
-        )
-        self.btn_log.bind(on_press=self.handle_logging)
-        btn_layout.add_widget(self.btn_log)
-
-        self.btn_scan_qr = Button(
-            text="Scan QR",
-            size_hint_x=0.4,
-            background_color=(0.8, 0.2, 0.2, 1)
-        )
-        self.btn_scan_qr.bind(on_press=self.handle_qr_scan)
-        btn_layout.add_widget(self.btn_scan_qr)
-        content.add_widget(btn_layout)
-
-        # Reports & Export
-        content.add_widget(
-            Label(text="Reports & Export", font_size=dp(16), bold=True,
-                  size_hint_y=None, height=dp(30))
-        )
-
-        self.sort_spinner = Spinner(
-            text="Recent",
-            values=("Recent", "Alphabetical"),
-            size_hint_y=None, height=dp(42)
-        )
-        content.add_widget(self.sort_spinner)
-
-        self.format_spinner = Spinner(
-            text="Spreadsheet (CSV)",
-            values=("Spreadsheet (CSV)", "Text Document (.txt)"),
-            size_hint_y=None, height=dp(42)
-        )
-        content.add_widget(self.format_spinner)
-
-        self.btn_export = Button(
-            text="Export Report to Downloads",
-            size_hint_y=None, height=dp(48),
-            background_color=(0.8, 0.4, 0.1, 1)
-        )
-        self.btn_export.bind(on_press=self.handle_export)
-        content.add_widget(self.btn_export)
-
-        # Status display
-        self.status_label = Label(
-            text="System ready. Waiting for input...",
-            size_hint_y=None, height=dp(120),
-            halign="center", valign="middle"
-        )
-        self.status_label.bind(texture_size=self.status_label.setter('size'))
-        content.add_widget(self.status_label)
-
-        scroll.add_widget(content)
+        self.status = Label(text="Offline database ready. Data is saved on this phone.", halign="center", valign="middle", size_hint_y=None, height=dp(110))
+        self.status.bind(size=lambda inst, val: setattr(inst, "text_size", val))
+        body.add_widget(self.status)
+        scroll.add_widget(body)
         self.add_widget(scroll)
 
-    def handle_registration(self, instance):
-        """Handle student registration."""
-        result = register_student_db(
-            self.txt_id.text, self.txt_name.text, self.txt_course.text
-        )
-        self.status_label.text = result['message']
-        if result['success']:
-            self.txt_id.text = ""
-            self.txt_name.text = ""
-            self.txt_course.text = ""
+    def refresh_sections(self):
+        names = section_names()
+        self.section_spinner.values = names
+        if names and self.section_spinner.text == "Select Section":
+            self.section_spinner.text = names[0]
 
-    def handle_logging(self, instance):
-        """Handle manual student logging."""
-        mode = self.mode_spinner.text
-        session = self.txt_session.text.strip()
-        student_id = self.txt_scan_id.text.strip()
+    def selected_section(self):
+        return "" if self.section_spinner.text == "Select Section" else self.section_spinner.text.strip()
 
-        result = log_student(student_id, mode, session)
-        self.status_label.text = result['message']
-        if result['success']:
-            self.txt_scan_id.text = ""
-
-    def handle_qr_scan(self, instance):
-        """Handle QR code scanning in background thread."""
-        if self.scanning:
-            self.status_label.text = "[INFO] Scan already in progress..."
+    def add_section(self, *_):
+        name = self.new_section.text.strip()
+        if not name:
+            self.status.text = "Enter a section name first."
             return
+        ensure_section(name)
+        self.new_section.text = ""
+        self.refresh_sections()
+        self.section_spinner.text = name
+        self.status.text = f"Section ready: {name}"
 
-        if not self.qr_scanner.camera_available:
-            self.status_label.text = "[ERROR] Camera not available. Use manual entry."
+    def register(self, *_):
+        section = self.selected_section()
+        ok, result = register_student(self.student_id.text, self.student_name.text, self.student_course.text, section)
+        if not ok:
+            self.status.text = result
             return
+        self.student_id.text = self.student_name.text = self.student_course.text = ""
+        self.qr_path = result
+        student = find_student(os.path.basename(result).rsplit(".",1)[0]) if result.endswith(".png") else None
+        if student:
+            self.show_qr(student, result)
+        else:
+            self.status.text = "Student saved and QR generated."
 
-        self.scanning = True
-        self.btn_scan_qr.disabled = True
-        self.status_label.text = "[INFO] Starting QR scan... Please point camera at QR code."
+    def show_qr(self, student, path):
+        sid, name, course, section = student
+        box = BoxLayout(orientation="vertical", spacing=dp(6), padding=dp(8))
+        box.add_widget(Label(text=f"{name}\n{sid}\n{course} • {section}", size_hint_y=None, height=dp(70), halign="center"))
+        box.add_widget(Image(source=path, allow_stretch=True, keep_ratio=True))
+        buttons = BoxLayout(size_hint_y=None, height=dp(50), spacing=dp(6))
+        download = Button(text="Download")
+        share = Button(text="Share")
+        close = Button(text="Close")
+        buttons.add_widget(download); buttons.add_widget(share); buttons.add_widget(close)
+        box.add_widget(buttons)
+        popup = Popup(title="Student QR Code", content=box, size_hint=(0.94, 0.90))
+        download.bind(on_release=lambda *_: self.download_qr(path, popup))
+        share.bind(on_release=lambda *_: self.share_qr(path))
+        close.bind(on_release=popup.dismiss)
+        popup.open()
 
-        thread = Thread(target=self._scan_qr_thread, daemon=True)
-        thread.start()
+    def download_qr(self, path, popup=None):
+        dest = StorageManager.copy_file_to_downloads(path, os.path.basename(path))
+        self.status.text = f"QR downloaded: {os.path.basename(dest or path)}"
+        if popup: popup.dismiss()
 
-    def _scan_qr_thread(self):
-        """Background thread for QR scanning."""
-        try:
-            student_number = self.qr_scanner.scan_qr_code(timeout=30)
-            if student_number:
-                Clock.schedule_once(lambda dt: self._handle_scanned_student(student_number), 0)
-            else:
-                Clock.schedule_once(lambda dt: self._scan_timeout(), 0)
-        except Exception as e:
-            Logger.error(f'Scan error: {e}')
-            Clock.schedule_once(lambda dt: self._scan_error(str(e)), 0)
+    def share_qr(self, path):
+        if not android_share(path):
+            self.status.text = "Share sheet could not open. Use Download instead."
 
-    def _handle_scanned_student(self, student_number):
-        """Process scanned student."""
-        self.txt_scan_id.text = student_number
-        mode = self.mode_spinner.text
-        session = self.txt_session.text.strip()
-        result = self.qr_scanner.log_scanned_student(student_number, mode, session)
-        self.status_label.text = result['message']
-        self.scanning = False
-        self.btn_scan_qr.disabled = False
+    def scan(self, *_):
+        if PermissionsHandler:
+            try: PermissionsHandler.request_camera_permission()
+            except Exception: pass
+        ScannerPopup(self.process_scan).open()
 
-    def _scan_timeout(self):
-        """Handle scan timeout."""
-        self.status_label.text = "[INFO] QR scan timeout. No code detected."
-        self.scanning = False
-        self.btn_scan_qr.disabled = False
+    def process_scan(self, value):
+        self.manual_id.text = value
+        self.manual_attendance()
 
-    def _scan_error(self, error):
-        """Handle scan error."""
-        self.status_label.text = f"[ERROR] Scan error: {error}"
-        self.scanning = False
-        self.btn_scan_qr.disabled = False
+    def manual_attendance(self, *_):
+        ok, msg = record_attendance(self.manual_id.text, "Attendance", self.session.text, self.selected_section())
+        self.status.text = msg
+        if ok: self.manual_id.text = ""
 
-    def handle_export(self, instance):
-        """Handle report export."""
-        mode = self.mode_spinner.text
-        sorting = self.sort_spinner.text
-        export_type = self.format_spinner.text
+    def export(self, *_):
+        path = export_report("Attendance", self.selected_section())
+        self.status.text = f"Report saved: {os.path.basename(path)}" if path else "No attendance records for this section."
 
-        self.status_label.text = "[INFO] Exporting report..."
-        result = export_reports(mode, sorting, export_type)
-        self.status_label.text = result['message']
-
-
-# ============================================================
-# APPLICATION
-# ============================================================
 
 class CvSUApp(App):
-
     def build(self):
-        self.title = "CvSU Offline Student Tracker"
-
-        # Request permissions on Android
-        if PERMISSIONS_AVAILABLE:
-            try:
-                PermissionsHandler.request_all_permissions()
-                Logger.info('App: Permissions requested')
-            except Exception as e:
-                Logger.warning(f'App: Permission request failed: {e}')
-
-        # Initialize database
+        self.title = "CvSU Offline Attendance"
+        Window.softinput_mode = "below_target"
         init_db()
-
-        # Create demo student if needed
-        if not get_student("2023-12345"):
-            register_student_db("2023-12345", "Juan Dela Cruz", "BSIT 3-1")
-
-        return CvSUSystemUI()
+        if PermissionsHandler:
+            try: PermissionsHandler.request_all_permissions()
+            except Exception: pass
+        return AppUI()
 
 
 if __name__ == "__main__":
